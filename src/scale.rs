@@ -2,8 +2,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use esp_idf_svc::bt::ble::gap::{
     AdvertisingDataType, BleGapEvent, EspBleGap, GapSearchEvent, GapSearchResult, ScanParams,
 };
@@ -15,11 +13,15 @@ use esp_idf_svc::bt::ble::gatt::{self, GattInterface, GattStatus, Handle, Proper
 use esp_idf_svc::bt::{BdAddr, Ble, BtDriver, BtStatus, BtUuid};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::sys::{EspError, ESP_FAIL};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
-use crate::protocol::{LiveWeightFrame, UnlockCommand};
+use crate::base64::Base64;
+use crate::protocol::{
+    BasicGuestProfileCommand, FinalWeightFrame, HundredthsKg, LiveWeightFrame,
+    SetDisplayUnitCommand,
+};
 
 const APP_ID: u16 = 0;
 const SCALE_COMPANY_ID_LE: [u8; 2] = [0x10, 0x1a];
@@ -28,6 +30,10 @@ const SCALE_ALT_SERVICE_UUID: BtUuid = BtUuid::uuid16(0xfff0);
 const NOTIFY_CHARACTERISTIC_UUID: BtUuid = BtUuid::uuid16(0x2a10);
 const WRITE_CHARACTERISTIC_UUID: BtUuid = BtUuid::uuid16(0x2a11);
 const CCCD_UUID: BtUuid = BtUuid::uuid16(0x2902);
+const NVS_NAMESPACE: &str = "scale";
+const LAST_WEIGHT_KEY: &str = "last_weight";
+const DEFAULT_LAST_WEIGHT: HundredthsKg = HundredthsKg::new(8_000);
+const MINIMUM_STORED_WEIGHT: HundredthsKg = HundredthsKg::new(5_000);
 
 type ScaleBtDriver = BtDriver<'static, Ble>;
 type ScaleGap = Arc<EspBleGap<'static, Ble, Arc<ScaleBtDriver>>>;
@@ -43,6 +49,7 @@ struct State {
     notify_handle: Option<Handle>,
     cccd_handle: Option<Handle>,
     write_handle: Option<Handle>,
+    profile_sent: bool,
 }
 
 #[derive(Clone)]
@@ -50,16 +57,30 @@ struct ScaleClient {
     gap: ScaleGap,
     gattc: ScaleGattc,
     state: Arc<Mutex<State>>,
+    nvs: Arc<Mutex<EspDefaultNvs>>,
 }
 
 pub fn run() -> anyhow::Result<()> {
     let peripherals = Peripherals::take()?;
-    let nvs = EspDefaultNvsPartition::take()?;
-    let bt = Arc::new(BtDriver::new(peripherals.modem, Some(nvs))?);
+    let nvs_partition = EspDefaultNvsPartition::take()?;
+    let nvs = EspNvs::new(nvs_partition.clone(), NVS_NAMESPACE, true)?;
+    let last_weight = nvs.get_u32(LAST_WEIGHT_KEY)?.map(HundredthsKg::new);
+    info!(
+        "Previous weight: {}{}",
+        last_weight.unwrap_or(DEFAULT_LAST_WEIGHT),
+        if last_weight.is_some() {
+            " (NVS)"
+        } else {
+            " (default)"
+        }
+    );
+
+    let bt = Arc::new(BtDriver::new(peripherals.modem, Some(nvs_partition))?);
     let client = ScaleClient {
         gap: Arc::new(EspBleGap::new(bt.clone())?),
         gattc: Arc::new(EspGattc::new(bt)?),
         state: Arc::new(Mutex::new(State::default())),
+        nvs: Arc::new(Mutex::new(nvs)),
     };
 
     let gap_client = client.clone();
@@ -108,10 +129,8 @@ impl ScaleClient {
                 if let Some(data) = manufacturer_data
                     .filter(|data| data.len() >= 2 && data[..2] == SCALE_COMPANY_ID_LE)
                 {
-                    info!(
-                        "Found scale candidate {bda}, RSSI {rssi}, advertisement_base64={}",
-                        BASE64.encode(data)
-                    );
+                    info!("Found scale candidate {bda}, RSSI {rssi}");
+                    debug!("advertisement_base64={}", Base64(data));
 
                     let mut state = self.state.lock().unwrap();
                     if !state.connecting {
@@ -191,8 +210,8 @@ impl ScaleClient {
             }
             GattcEvent::WriteDescriptor { status, .. } => {
                 check_gatt_status(status)?;
-                info!("Notifications enabled; sending protocol unlock");
-                self.write_unlock(gatt_if)?;
+                info!("Notifications enabled; selecting kilograms");
+                self.write_display_unit(gatt_if)?;
             }
             GattcEvent::Notify {
                 addr,
@@ -201,17 +220,25 @@ impl ScaleClient {
                 is_notify,
                 ..
             } => {
-                if let Ok(frame) = LiveWeightFrame::try_from(value) {
-                    info!("Live weight: {}", frame.weight_hundredths_kg);
+                if let Ok(frame) = FinalWeightFrame::decode(value) {
+                    self.handle_final_weight(frame.weight)?;
+                } else if let Ok(frame) = LiveWeightFrame::decode(value) {
+                    debug!("Live weight: {}", frame.weight);
                 }
-                info!(
+                debug!(
                     "rx addr={addr} handle={handle} notify={is_notify} base64={}",
-                    BASE64.encode(value)
+                    Base64(value)
                 );
             }
             GattcEvent::WriteCharacteristic { status, .. } => {
                 check_gatt_status(status)?;
-                info!("Protocol unlock sent; waiting for scale messages");
+                let profile_sent = self.state.lock().unwrap().profile_sent;
+                if profile_sent {
+                    info!("Basic guest profile sent; waiting for scale messages");
+                } else {
+                    info!("Kilograms selected; sending basic guest profile");
+                    self.write_guest_profile(gatt_if)?;
+                }
             }
             GattcEvent::Disconnected { addr, reason, .. } => {
                 info!("Scale {addr} disconnected: {reason:?}");
@@ -345,17 +372,19 @@ impl ScaleClient {
         )
     }
 
-    fn write_unlock(&self, gatt_if: GattInterface) -> Result<(), EspError> {
+    fn write_display_unit(&self, gatt_if: GattInterface) -> Result<(), EspError> {
         let state = self.state.lock().unwrap();
         let (Some(conn_id), Some(write_handle)) = (state.conn_id, state.write_handle) else {
-            warn!("Cannot unlock scale: write characteristic is unavailable");
+            warn!("Cannot select display unit: write characteristic is unavailable");
             return Ok(());
         };
 
-        let command: Vec<u8> = UnlockCommand::new().try_into().map_err(|err| {
-            error!("Failed to encode unlock command: {err}");
-            EspError::from_infallible::<ESP_FAIL>()
-        })?;
+        let command: Vec<u8> = SetDisplayUnitCommand::kilograms()
+            .try_into()
+            .map_err(|err| {
+                error!("Failed to encode display-unit command: {err}");
+                EspError::from_infallible::<ESP_FAIL>()
+            })?;
 
         self.gattc.write_characteristic(
             gatt_if,
@@ -365,6 +394,59 @@ impl ScaleClient {
             GattWriteType::RequireResponse,
             GattAuthReq::None,
         )
+    }
+
+    fn write_guest_profile(&self, gatt_if: GattInterface) -> Result<(), EspError> {
+        let last_weight = self
+            .nvs
+            .lock()
+            .unwrap()
+            .get_u32(LAST_WEIGHT_KEY)?
+            .map(HundredthsKg::new)
+            .unwrap_or(DEFAULT_LAST_WEIGHT);
+        let command = BasicGuestProfileCommand::new(last_weight)
+            .to_bytes()
+            .map_err(|err| {
+                error!("Failed to encode basic guest profile: {err}");
+                EspError::from_infallible::<ESP_FAIL>()
+            })?;
+
+        let mut state = self.state.lock().unwrap();
+        let (Some(conn_id), Some(write_handle)) = (state.conn_id, state.write_handle) else {
+            warn!("Cannot send guest profile: write characteristic is unavailable");
+            return Ok(());
+        };
+        state.profile_sent = true;
+        drop(state);
+
+        info!("Guest profile previous weight: {last_weight}");
+        self.gattc.write_characteristic(
+            gatt_if,
+            conn_id,
+            write_handle,
+            &command,
+            GattWriteType::RequireResponse,
+            GattAuthReq::None,
+        )
+    }
+
+    fn handle_final_weight(&self, weight: HundredthsKg) -> Result<(), EspError> {
+        info!("Authoritative weight: {weight}");
+
+        if weight.hundredths() <= MINIMUM_STORED_WEIGHT.hundredths() {
+            info!("Not storing authoritative weight at or below {MINIMUM_STORED_WEIGHT}");
+            return Ok(());
+        }
+
+        let nvs = self.nvs.lock().unwrap();
+        if nvs.get_u32(LAST_WEIGHT_KEY)? != Some(weight.hundredths()) {
+            nvs.set_u32(LAST_WEIGHT_KEY, weight.hundredths())?;
+            info!("Stored authoritative weight for the next session");
+        } else {
+            info!("Authoritative weight matches NVS; not overwriting it");
+        }
+
+        Ok(())
     }
 }
 
