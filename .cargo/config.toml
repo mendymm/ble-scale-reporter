@@ -8,3 +8,5 @@ runner = "espflash flash --monitor"
 [unstable]
 build-std = ["std", "panic_abort"]
 
+[env]
+CARGO_WORKSPACE_DIR = { value = "", relative = true }

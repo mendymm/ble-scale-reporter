@@ -1,0 +1,8 @@
+{
+  "rust-analyzer.cargo.target": "xtensa-esp32-espidf",
+  "rust-analyzer.cargo.targetDir": true,
+  "rust-analyzer.cargo.buildScripts.enable": true,
+  "rust-analyzer.cargo.allTargets": false,
+  "rust-analyzer.check.allTargets": false,
+  "rust-analyzer.check.command": "check"
+}
