@@ -1,5 +1,6 @@
 mod base64;
-mod profile;
+mod config;
+mod heartbeat;
 mod protocol;
 mod scale;
 mod wifi;
@@ -17,5 +18,6 @@ fn main() -> anyhow::Result<()> {
     let nvs = esp_idf_svc::nvs::EspDefaultNvsPartition::take()?;
 
     wifi::start(wifi_modem, nvs.clone())?;
+    heartbeat::start()?;
     scale::run(bluetooth_modem, nvs)
 }

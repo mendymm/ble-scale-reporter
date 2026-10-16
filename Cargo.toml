@@ -15,6 +15,7 @@ harness = false
 [dependencies]
 anyhow = "1"
 deku = { version = "0.20.3", default-features = false, features = ["std", "descriptive-errors"] }
+embedded-svc = "0.29"
 esp-idf-svc = { version = "0.52.1", features = ["native"] }
 log = { version = "0.4", features = ["max_level_debug", "release_max_level_info"] }
 
