@@ -2,6 +2,7 @@ mod base64;
 mod profile;
 mod protocol;
 mod scale;
+mod wifi;
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -11,5 +12,10 @@ fn main() -> anyhow::Result<()> {
         log::LevelFilter::Info
     });
 
-    scale::run()
+    let peripherals = esp_idf_svc::hal::peripherals::Peripherals::take()?;
+    let (wifi_modem, bluetooth_modem) = peripherals.modem.split();
+    let nvs = esp_idf_svc::nvs::EspDefaultNvsPartition::take()?;
+
+    wifi::start(wifi_modem, nvs.clone())?;
+    scale::run(bluetooth_modem, nvs)
 }

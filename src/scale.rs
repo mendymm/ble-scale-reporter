@@ -12,7 +12,7 @@ use esp_idf_svc::bt::ble::gatt::client::{
 use esp_idf_svc::bt::ble::gatt::{self, GattInterface, GattStatus, Handle, Property};
 use esp_idf_svc::bt::{BdAddr, Ble, BtDriver, BtStatus, BtUuid};
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::hal::modem::BluetoothModem;
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::sys::{EspError, ESP_FAIL};
 use log::{debug, error, info, warn};
@@ -60,9 +60,10 @@ struct ScaleClient {
     nvs: Arc<Mutex<EspDefaultNvs>>,
 }
 
-pub fn run() -> anyhow::Result<()> {
-    let peripherals = Peripherals::take()?;
-    let nvs_partition = EspDefaultNvsPartition::take()?;
+pub fn run(
+    bluetooth_modem: BluetoothModem<'static>,
+    nvs_partition: EspDefaultNvsPartition,
+) -> anyhow::Result<()> {
     let nvs = EspNvs::new(nvs_partition.clone(), NVS_NAMESPACE, true)?;
     let last_weight = nvs.get_u32(LAST_WEIGHT_KEY)?.map(HundredthsKg::new);
     info!(
@@ -75,7 +76,7 @@ pub fn run() -> anyhow::Result<()> {
         }
     );
 
-    let bt = Arc::new(BtDriver::new(peripherals.modem, Some(nvs_partition))?);
+    let bt = Arc::new(BtDriver::new(bluetooth_modem, Some(nvs_partition))?);
     let client = ScaleClient {
         gap: Arc::new(EspBleGap::new(bt.clone())?),
         gattc: Arc::new(EspGattc::new(bt)?),
