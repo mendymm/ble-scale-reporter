@@ -1,0 +1,26 @@
+[package]
+name = "ble-scale-reporter"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[[bin]]
+name = "ble-scale-reporter"
+harness = false
+
+[dependencies]
+anyhow = "1"
+esp-idf-svc = { version = "0.52.1", features = ["native"] }
+log = "0.4"
+
+[build-dependencies]
+embuild = { version = "0.33.3", features = ["espidf"] }
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
