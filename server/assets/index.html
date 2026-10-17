@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Weight</title>
+    <link rel="stylesheet" href="/assets/uPlot.min.css">
+    <link rel="stylesheet" href="/assets/app.css">
+  </head>
+  <body>
+    <main>
+      <header class="page-header">
+        <h1>Weight</h1>
+        <span id="status" role="status">Loading…</span>
+      </header>
+
+      <dl class="summary" aria-label="Weight summary">
+        <div>
+          <dt>Latest</dt>
+          <dd><span id="latest-weight">—</span><small id="latest-weight-lbs" class="secondary-unit"></small></dd>
+          <dd class="detail" id="latest-date">No measurements</dd>
+        </div>
+        <div>
+          <dt>Change</dt>
+          <dd><span id="weight-change">—</span><small id="weight-change-lbs" class="secondary-unit"></small></dd>
+          <dd class="detail">From first report</dd>
+        </div>
+        <div>
+          <dt>Reports</dt>
+          <dd id="measurement-count">—</dd>
+          <dd class="detail">Stored measurements</dd>
+        </div>
+      </dl>
+
+      <section class="history" aria-labelledby="chart-title">
+        <header class="section-header">
+          <h2 id="chart-title">History</h2>
+          <span>kg / lbs</span>
+        </header>
+        <div id="empty-state" class="empty-state" hidden>No measurements yet.</div>
+        <div id="chart" aria-label="Weight over time"></div>
+        <div class="range-controls" aria-label="Chart time range">
+          <span>Range</span>
+          <div>
+            <button type="button" data-months="2" aria-pressed="false" disabled>2 months</button>
+            <button type="button" data-months="4" aria-pressed="false" disabled>4 months</button>
+            <button type="button" data-months="8" aria-pressed="false" disabled>8 months</button>
+            <button type="button" data-months="12" aria-pressed="false" disabled>12 months</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/assets/uPlot.iife.min.js"></script>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>
