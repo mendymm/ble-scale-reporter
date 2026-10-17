@@ -33,6 +33,8 @@ const UPLOT_JS: &str = include_str!("../assets/vendor/uPlot.iife.min.js");
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REPORT_SAMPLES: usize = 50;
+const MIN_DISPLAY_SAMPLES: usize = 5;
+const DISPLAY_DEDUP_SECONDS: i64 = 30;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
@@ -224,7 +226,32 @@ async fn list_reports(State(storage): State<Storage>) -> Result<Json<Vec<Report>
         .map_err(|join_error| AppError::new("database task failed", join_error))?
         .map_err(|storage_error| AppError::new("could not load reports", storage_error))?;
 
-    Ok(Json(reports))
+    Ok(Json(reports_for_display(reports)))
+}
+
+fn reports_for_display(reports: Vec<Report>) -> Vec<Report> {
+    let mut last_displayed_at = None;
+
+    reports
+        .into_iter()
+        .filter(|report| {
+            // Empty sample lists belong to reports created before samples were
+            // recorded. Keep those historical measurements visible.
+            if !report.samples.is_empty() && report.samples.len() < MIN_DISPLAY_SAMPLES {
+                return false;
+            }
+
+            let timestamp = report.timestamp.unix_timestamp();
+            if last_displayed_at
+                .is_some_and(|previous| timestamp - previous < DISPLAY_DEDUP_SECONDS)
+            {
+                return false;
+            }
+
+            last_displayed_at = Some(timestamp);
+            true
+        })
+        .collect()
 }
 
 async fn index() -> Response<Body> {
@@ -368,9 +395,10 @@ mod tests {
     };
     use rusqlite::Connection;
     use tempfile::tempdir;
+    use time::OffsetDateTime;
     use tower::ServiceExt;
 
-    use super::{Report, Storage, router};
+    use super::{Report, Storage, reports_for_display, router};
 
     #[tokio::test]
     async fn posting_a_report_persists_and_lists_it() {
@@ -384,7 +412,7 @@ mod tests {
                 Request::post("/api/report")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"timestamp":1760616000,"weight":8085,"samples":[8030,8084,8085]}"#,
+                        r#"{"timestamp":1760616000,"weight":8085,"samples":[8030,8072,8084,8085,8085]}"#,
                     ))
                     .unwrap(),
             )
@@ -394,7 +422,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(
             fs::read_to_string(data_dir.path().join("reports/1760616000.json")).unwrap(),
-            "{\"timestamp\":1760616000,\"weight\":8085,\"samples\":[8030,8084,8085]}\n"
+            "{\"timestamp\":1760616000,\"weight\":8085,\"samples\":[8030,8072,8084,8085,8085]}\n"
         );
 
         let response = app
@@ -408,7 +436,7 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].timestamp.unix_timestamp(), 1_760_616_000);
         assert_eq!(reports[0].weight, 8_085);
-        assert_eq!(reports[0].samples, [8_030, 8_084, 8_085]);
+        assert_eq!(reports[0].samples, [8_030, 8_072, 8_084, 8_085, 8_085]);
         assert_eq!(storage.list().unwrap(), reports);
     }
 
@@ -512,6 +540,30 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].weight, 8_085);
         assert!(reports[0].samples.is_empty());
+    }
+
+    #[test]
+    fn display_reports_filters_short_and_duplicate_sessions() {
+        let report = |timestamp, samples| Report {
+            timestamp: OffsetDateTime::from_unix_timestamp(timestamp).unwrap(),
+            weight: 8_085,
+            samples,
+        };
+        let reports = vec![
+            report(100, vec![8_085; 5]),
+            report(110, vec![8_085]),
+            report(120, vec![8_085; 5]),
+            report(130, vec![8_085; 5]),
+            report(200, Vec::new()),
+        ];
+
+        let displayed = reports_for_display(reports);
+        let timestamps = displayed
+            .iter()
+            .map(|report| report.timestamp.unix_timestamp())
+            .collect::<Vec<_>>();
+
+        assert_eq!(timestamps, [100, 130, 200]);
     }
 
     #[tokio::test]

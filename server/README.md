@@ -33,9 +33,13 @@ hundredths of a kilogram, and the raw live-weight samples used by the firmware:
 {"timestamp": 1760616000, "weight": 8085, "samples": [8030, 8072, 8084, 8085]}
 ```
 
-`GET /api/reports` returns all measurements in chronological order. `GET /`
-serves the UI. Samples are stored as JSON text in the `samples` SQLite column;
-the UI currently ignores them.
+`GET /api/reports` returns the measurements used by the UI in chronological
+order. It hides sessions with fewer than five samples and suppresses subsequent
+measurements within 30 seconds of the last displayed measurement. Reports from
+before sample collection was added remain visible. All reports and samples are
+still stored; samples use JSON text in the `samples` SQLite column.
+
+`GET /` serves the UI.
 
 ## Build a static Linux executable
 
