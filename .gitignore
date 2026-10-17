@@ -6,3 +6,4 @@
 /firmware/sdkconfig.old
 /.env
 /firmware/.env
+/firmware/root-ca.cert.pem

@@ -12,6 +12,10 @@ cp firmware/.env.example firmware/.env
 
 Edit the copied file with your WiFi credentials, health-check URL, and report URL. The report URL may use either `http://` or `https://`.
 
+Place the root CA used to sign the reporting server's certificate at
+`firmware/root-ca.cert.pem`. The file is ignored by Git and embedded into the
+firmware at build time as the trusted CA for report uploads.
+
 Build, flash, and monitor the ESP32:
 
 ```sh

@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context};
 use embedded_svc::http::client::Client;
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
+use esp_idf_svc::tls::X509;
 use log::{info, warn};
 
 use crate::config::REPORT_URL;
@@ -13,6 +14,7 @@ use crate::protocol::HundredthsKg;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const THREAD_STACK_SIZE: usize = 16 * 1024;
+const REPORT_ROOT_CA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/report-root-ca.cert.pem"));
 
 pub fn start() -> anyhow::Result<Sender<HundredthsKg>> {
     let (sender, receiver) = mpsc::channel();
@@ -47,7 +49,7 @@ fn send(weight: HundredthsKg) -> anyhow::Result<()> {
     let content_length = body.len().to_string();
     let configuration = Configuration {
         timeout: Some(REQUEST_TIMEOUT),
-        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        server_certificate: Some(X509::pem_until_nul(REPORT_ROOT_CA)),
         ..Default::default()
     };
     let connection = EspHttpConnection::new(&configuration)
