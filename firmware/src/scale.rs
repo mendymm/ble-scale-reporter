@@ -18,6 +18,7 @@ use esp_idf_svc::sys::{EspError, ESP_FAIL};
 use log::{debug, error, info, warn};
 
 use crate::base64::Base64;
+use crate::heartbeat::wait_for_valid_time;
 use crate::protocol::{
     BasicGuestProfileCommand, FinalWeightFrame, HundredthsKg, LiveWeightFrame,
     SetDisplayUnitCommand,
@@ -106,6 +107,7 @@ pub fn run(
     client.gattc.register_app(APP_ID)?;
     gatt::set_local_mtu(256)?;
     info!("BLE initialized; wake the scale by stepping on it");
+    wait_for_valid_time();
     status_light.ready();
 
     loop {

@@ -1,12 +1,4 @@
-use std::{
-    env,
-    error::Error,
-    ffi::OsString,
-    io,
-    net::SocketAddr,
-    path::PathBuf,
-    time::Duration,
-};
+use std::{env, error::Error, ffi::OsString, io, net::SocketAddr, path::PathBuf, time::Duration};
 
 use axum_server::{Handle, tls_rustls::RustlsConfig};
 use ble_scale_server::{Storage, router};
