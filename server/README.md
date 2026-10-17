@@ -26,15 +26,16 @@ $DATA_DIR/
 
 ## API
 
-`POST /api/report` accepts a Unix timestamp in seconds and an exact weight in
-hundredths of a kilogram:
+`POST /api/report` accepts a Unix timestamp in seconds, a calculated weight in
+hundredths of a kilogram, and the raw live-weight samples used by the firmware:
 
 ```json
-{"timestamp": 1760616000, "weight": 8085}
+{"timestamp": 1760616000, "weight": 8085, "samples": [8030, 8072, 8084, 8085]}
 ```
 
 `GET /api/reports` returns all measurements in chronological order. `GET /`
-serves the UI.
+serves the UI. Samples are stored as JSON text in the `samples` SQLite column;
+the UI currently ignores them.
 
 ## Build a static Linux executable
 

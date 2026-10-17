@@ -1,6 +1,7 @@
 mod base64;
 mod config;
 mod heartbeat;
+mod measurement;
 mod protocol;
 mod report;
 mod scale;
@@ -23,5 +24,6 @@ fn main() -> anyhow::Result<()> {
     wifi::start(wifi_modem, nvs.clone())?;
     heartbeat::start()?;
     let reporter = report::start()?;
-    scale::run(bluetooth_modem, nvs, reporter, status_light)
+    let measurements = measurement::start(reporter)?;
+    scale::run(bluetooth_modem, nvs, measurements, status_light)
 }

@@ -16,7 +16,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const THREAD_STACK_SIZE: usize = 16 * 1024;
 const REPORT_ROOT_CA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/report-root-ca.cert.pem"));
 
-pub fn start() -> anyhow::Result<Sender<HundredthsKg>> {
+pub(crate) struct WeightReport {
+    pub weight: u16,
+    pub samples: Vec<u16>,
+}
+
+pub(crate) fn start() -> anyhow::Result<Sender<WeightReport>> {
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name("weight-report".into())
@@ -26,14 +31,17 @@ pub fn start() -> anyhow::Result<Sender<HundredthsKg>> {
     Ok(sender)
 }
 
-fn run(receiver: Receiver<HundredthsKg>) {
-    for weight in receiver {
+fn run(receiver: Receiver<WeightReport>) {
+    for report in receiver {
         wait_for_valid_time();
 
-        match send(weight) {
-            Ok(()) => info!("Authoritative weight report accepted: {weight}"),
+        match send(&report) {
+            Ok(()) => info!(
+                "Calculated weight report accepted: {}",
+                HundredthsKg::new(u32::from(report.weight))
+            ),
             Err(error) => {
-                warn!("Authoritative weight report failed: {error:#}");
+                warn!("Calculated weight report failed: {error:#}");
                 let message = format!("Weight report failed: {error}");
                 if let Err(notification_error) = send_report_failure(&message) {
                     warn!("Could not send report failure notification: {notification_error:#}");
@@ -43,14 +51,20 @@ fn run(receiver: Receiver<HundredthsKg>) {
     }
 }
 
-fn send(weight: HundredthsKg) -> anyhow::Result<()> {
+fn send(report: &WeightReport) -> anyhow::Result<()> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system time is before Unix epoch")?
         .as_secs();
+    let samples = report
+        .samples
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let body = format!(
-        r#"{{"timestamp":{timestamp},"weight":{}}}"#,
-        weight.hundredths()
+        r#"{{"timestamp":{timestamp},"weight":{},"samples":[{samples}]}}"#,
+        report.weight
     );
     let content_length = body.len().to_string();
     let configuration = Configuration {

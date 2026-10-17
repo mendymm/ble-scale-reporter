@@ -54,15 +54,25 @@ def main() -> None:
             """
             CREATE TABLE IF NOT EXISTS reports (
                 timestamp INTEGER PRIMARY KEY,
-                weight INTEGER NOT NULL CHECK (weight BETWEEN 0 AND 4294967295)
+                weight INTEGER NOT NULL CHECK (weight BETWEEN 0 AND 4294967295),
+                samples TEXT NOT NULL DEFAULT '[]'
             ) STRICT
             """
         )
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(reports)")
+        }
+        if "samples" not in columns:
+            connection.execute(
+                "ALTER TABLE reports ADD COLUMN samples TEXT NOT NULL DEFAULT '[]'"
+            )
         connection.executemany(
             """
-            INSERT INTO reports (timestamp, weight)
-            VALUES (?, ?)
-            ON CONFLICT(timestamp) DO UPDATE SET weight = excluded.weight
+            INSERT INTO reports (timestamp, weight, samples)
+            VALUES (?, ?, '[]')
+            ON CONFLICT(timestamp) DO UPDATE SET
+                weight = excluded.weight,
+                samples = excluded.samples
             """,
             reports,
         )

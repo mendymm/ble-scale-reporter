@@ -23,4 +23,7 @@ cd firmware
 cargo run --release
 ```
 
-The last authoritative weight is stored in NVS and used as the scale's previous weight on the next measurement.
+The firmware calculates each final weight from live BLE readings. It collects
+up to 50 readings over at most eight seconds, finds the largest cluster whose
+readings span no more than one kilogram, and uses that cluster's median. The raw
+samples are uploaded with the calculated weight for later analysis.

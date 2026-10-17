@@ -64,53 +64,6 @@ impl SetDisplayUnitCommand {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, DekuWrite)]
-struct BasicGuestProfilePayload {
-    sex_and_slot: u8,
-    #[deku(endian = "big")]
-    birth_year: u16,
-    birth_month: u8,
-    birth_day: u8,
-    #[deku(endian = "big")]
-    height_tenths_cm: u16,
-    #[deku(endian = "big")]
-    last_weight_hundredths_kg: u32,
-    flags: u8,
-    guest_marker: u8,
-    no_impedance: u8,
-}
-
-/// Command `0x96`: an ephemeral guest profile requesting weight only.
-pub struct BasicGuestProfileCommand(BasicGuestProfilePayload);
-
-impl BasicGuestProfileCommand {
-    pub const fn new(last_weight: HundredthsKg) -> Self {
-        Self(BasicGuestProfilePayload {
-            // Male in bits 5:4 and guest slot 9 in bits 3:0.
-            sex_and_slot: 0x19,
-            birth_year: 2000,
-            birth_month: 1,
-            birth_day: 1,
-            height_tenths_cm: 1_700,
-            last_weight_hundredths_kg: last_weight.0,
-            // Non-athlete, algorithm 3. These are structural placeholders when
-            // the no-impedance trailer below is used.
-            flags: 0xa9,
-            guest_marker: 0xff,
-            no_impedance: 0x06,
-        })
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>, deku::DekuError> {
-        let payload: Vec<u8> = self.0.try_into()?;
-        let mut frame = Vec::with_capacity(20);
-        frame.extend_from_slice(&[0x55, 0xaa, 0x96, 0x00, 0x0e]);
-        frame.extend_from_slice(&payload);
-        frame.push(checksum(&frame));
-        Ok(frame)
-    }
-}
-
 /// A `0x14` notification containing the scale's current live weight.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, DekuRead)]
 #[deku(magic = b"\x55\xaa")]
@@ -133,38 +86,6 @@ impl LiveWeightFrame {
     }
 }
 
-/// An authoritative `0x18` final report from an extended-protocol scale.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, DekuRead)]
-#[deku(magic = b"\x55\xaa")]
-pub struct FinalWeightFrame {
-    #[deku(assert_eq = "0x18")]
-    command: u8,
-    #[deku(endian = "big", assert_eq = "13")]
-    payload_length: u16,
-    status: u8,
-    reserved: u8,
-    guest_slot: u8,
-    pub weight: HundredthsKg,
-    #[deku(endian = "big")]
-    resistance_ohms: u16,
-    #[deku(endian = "big")]
-    bmi_tenths: u16,
-    #[deku(endian = "big")]
-    body_fat_tenths_percent: u16,
-    check_byte: u8,
-}
-
-impl FinalWeightFrame {
-    pub fn decode(bytes: &[u8]) -> Result<Self, FrameError> {
-        validate_frame(bytes, 0x18, 13)?;
-        let frame = Self::try_from(bytes).map_err(FrameError::Decode)?;
-        if frame.status != 1 {
-            return Err(FrameError::UnexpectedStatus(frame.status));
-        }
-        Ok(frame)
-    }
-}
-
 #[derive(Debug)]
 pub enum FrameError {
     WrongLength { expected: usize, actual: usize },
@@ -172,7 +93,6 @@ pub enum FrameError {
     WrongCommand { expected: u8, actual: u8 },
     WrongPayloadLength { expected: u16, actual: u16 },
     BadChecksum { expected: u8, actual: u8 },
-    UnexpectedStatus(u8),
     Decode(deku::DekuError),
 }
 
@@ -198,9 +118,6 @@ impl fmt::Display for FrameError {
                 formatter,
                 "bad checksum: expected 0x{expected:02x}, got 0x{actual:02x}"
             ),
-            Self::UnexpectedStatus(status) => {
-                write!(formatter, "unexpected final-frame status 0x{status:02x}")
-            }
             Self::Decode(error) => write!(formatter, "cannot decode frame: {error}"),
         }
     }
@@ -269,18 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn decodes_observed_authoritative_weight() {
-        let bytes = [
-            0x55, 0xaa, 0x18, 0x00, 0x0d, 0x01, 0x01, 0x09, 0x00, 0x00, 0x1f, 0x95, 0x00, 0x00,
-            0x01, 0x20, 0x00, 0x00, 0x04,
-        ];
-
-        let frame = FinalWeightFrame::decode(&bytes).unwrap();
-
-        assert_eq!(frame.weight, HundredthsKg(8_085));
-    }
-
-    #[test]
     fn serializes_set_display_unit_command() {
         let bytes: Vec<u8> = SetDisplayUnitCommand::kilograms().try_into().unwrap();
 
@@ -288,18 +193,6 @@ mod tests {
             bytes,
             [0x55, 0xaa, 0x90, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x94]
         );
-    }
-
-    #[test]
-    fn serializes_basic_guest_profile() {
-        let command = BasicGuestProfileCommand::new(HundredthsKg::new(8_000));
-        let bytes = command.to_bytes().unwrap();
-
-        assert_eq!(bytes.len(), 20);
-        assert_eq!(&bytes[..5], &[0x55, 0xaa, 0x96, 0x00, 0x0e]);
-        assert_eq!(bytes[19], checksum(&bytes[..19]));
-        assert_eq!(&bytes[12..16], &[0x00, 0x00, 0x1f, 0x40]);
-        assert_eq!(bytes[18], 0x06);
     }
 
     #[test]

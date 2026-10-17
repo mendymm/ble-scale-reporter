@@ -12,43 +12,51 @@ const THREAD_STACK_SIZE: usize = 4 * 1024;
 
 #[derive(Clone)]
 pub struct StatusLight {
-    ready: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
 }
 
 pub fn start(pin: Gpio2<'static>) -> anyhow::Result<StatusLight> {
-    let ready = Arc::new(AtomicBool::new(false));
-    let thread_ready = ready.clone();
+    let healthy = Arc::new(AtomicBool::new(false));
+    let thread_healthy = healthy.clone();
     let led = PinDriver::output(pin)?;
 
     thread::Builder::new()
         .name("status-light".into())
         .stack_size(THREAD_STACK_SIZE)
-        .spawn(move || run(led, thread_ready))?;
+        .spawn(move || run(led, thread_healthy))?;
 
-    Ok(StatusLight { ready })
+    Ok(StatusLight { healthy })
 }
 
 impl StatusLight {
-    pub fn ready(&self) {
-        self.ready.store(true, Ordering::Release);
+    pub fn healthy(&self) {
+        self.healthy.store(true, Ordering::Release);
     }
 }
 
-fn run(mut led: PinDriver<'static, Output>, ready: Arc<AtomicBool>) {
-    let mut on = false;
+fn run(mut led: PinDriver<'static, Output>, healthy: Arc<AtomicBool>) {
+    if led.set_low().is_err() {
+        return;
+    }
 
     loop {
-        if ready.load(Ordering::Acquire) {
-            let _ = led.set_high();
+        if healthy.load(Ordering::Acquire) {
+            let _ = led.set_low();
             return;
         }
 
-        on = !on;
-        let result = if on { led.set_high() } else { led.set_low() };
-        if result.is_err() {
+        if toggle(&mut led).is_err() {
             return;
         }
 
         thread::sleep(BLINK_INTERVAL);
+    }
+}
+
+fn toggle(led: &mut PinDriver<'static, Output>) -> Result<(), esp_idf_svc::sys::EspError> {
+    if led.is_set_high() {
+        led.set_low()
+    } else {
+        led.set_high()
     }
 }

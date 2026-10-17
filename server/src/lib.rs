@@ -32,6 +32,7 @@ const UPLOT_CSS: &str = include_str!("../assets/vendor/uPlot.min.css");
 const UPLOT_JS: &str = include_str!("../assets/vendor/uPlot.iife.min.js");
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REPORT_SAMPLES: usize = 50;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
@@ -46,6 +47,7 @@ pub struct Report {
     #[serde(with = "time::serde::timestamp")]
     pub timestamp: OffsetDateTime,
     pub weight: u32,
+    pub samples: Vec<u16>,
 }
 
 impl Storage {
@@ -64,9 +66,11 @@ impl Storage {
              PRAGMA synchronous = FULL;
              CREATE TABLE IF NOT EXISTS reports (
                  timestamp INTEGER PRIMARY KEY,
-                 weight INTEGER NOT NULL CHECK (weight BETWEEN 0 AND 4294967295)
+                 weight INTEGER NOT NULL CHECK (weight BETWEEN 0 AND 4294967295),
+                 samples TEXT NOT NULL DEFAULT '[]'
              ) STRICT;",
         )?;
+        ensure_samples_column(&connection)?;
 
         Ok(storage)
     }
@@ -79,11 +83,18 @@ impl Storage {
         self.write_report_file(report)?;
 
         let connection = self.connect()?;
+        let samples = serde_json::to_string(&report.samples)?;
         connection.execute(
-            "INSERT INTO reports (timestamp, weight)
-             VALUES (?1, ?2)
-             ON CONFLICT(timestamp) DO UPDATE SET weight = excluded.weight",
-            params![report.timestamp.unix_timestamp(), i64::from(report.weight)],
+            "INSERT INTO reports (timestamp, weight, samples)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(timestamp) DO UPDATE SET
+                 weight = excluded.weight,
+                 samples = excluded.samples",
+            params![
+                report.timestamp.unix_timestamp(),
+                i64::from(report.weight),
+                samples
+            ],
         )?;
 
         Ok(())
@@ -91,20 +102,31 @@ impl Storage {
 
     pub fn list(&self) -> Result<Vec<Report>, StorageError> {
         let connection = self.connect()?;
-        let mut statement =
-            connection.prepare("SELECT timestamp, weight FROM reports ORDER BY timestamp")?;
+        let mut statement = connection
+            .prepare("SELECT timestamp, weight, samples FROM reports ORDER BY timestamp")?;
         let stored_reports = statement
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
 
         stored_reports
             .into_iter()
-            .map(|(timestamp, weight)| {
+            .map(|(timestamp, weight, samples)| {
                 let timestamp = OffsetDateTime::from_unix_timestamp(timestamp)
                     .map_err(|_| StorageError::InvalidTimestamp(timestamp))?;
                 let weight =
                     u32::try_from(weight).map_err(|_| StorageError::InvalidWeight(weight))?;
-                Ok(Report { timestamp, weight })
+                let samples = serde_json::from_str(&samples)?;
+                Ok(Report {
+                    timestamp,
+                    weight,
+                    samples,
+                })
             })
             .collect()
     }
@@ -141,6 +163,25 @@ impl Storage {
     }
 }
 
+fn ensure_samples_column(connection: &Connection) -> Result<(), rusqlite::Error> {
+    let has_samples = {
+        let mut statement = connection.prepare("PRAGMA table_info(reports)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        columns.iter().any(|column| column == "samples")
+    };
+
+    if !has_samples {
+        connection.execute(
+            "ALTER TABLE reports ADD COLUMN samples TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
 fn create_new_file(path: &Path) -> Result<File, std::io::Error> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
@@ -162,6 +203,13 @@ async fn create_report(
     State(storage): State<Storage>,
     Json(report): Json<Report>,
 ) -> Result<StatusCode, AppError> {
+    if report.samples.is_empty() {
+        return Err(AppError::invalid_report("samples must not be empty"));
+    }
+    if report.samples.len() > MAX_REPORT_SAMPLES {
+        return Err(AppError::invalid_report("too many samples"));
+    }
+
     tokio::task::spawn_blocking(move || storage.save(&report))
         .await
         .map_err(|join_error| AppError::new("persistence task failed", join_error))?
@@ -226,18 +274,31 @@ fn embedded_response(
 }
 
 #[derive(Debug)]
-struct AppError;
+struct AppError {
+    status: StatusCode,
+    message: &'static str,
+}
 
 impl AppError {
     fn new(context: &'static str, source: impl fmt::Display) -> Self {
         error!(%source, "{context}");
-        Self
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "internal server error",
+        }
+    }
+
+    fn invalid_report(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message,
+        }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        (self.status, self.message).into_response()
     }
 }
 
@@ -305,6 +366,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
+    use rusqlite::Connection;
     use tempfile::tempdir;
     use tower::ServiceExt;
 
@@ -321,7 +383,9 @@ mod tests {
             .oneshot(
                 Request::post("/api/report")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"timestamp":1760616000,"weight":8085}"#))
+                    .body(Body::from(
+                        r#"{"timestamp":1760616000,"weight":8085,"samples":[8030,8084,8085]}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -330,7 +394,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(
             fs::read_to_string(data_dir.path().join("reports/1760616000.json")).unwrap(),
-            "{\"timestamp\":1760616000,\"weight\":8085}\n"
+            "{\"timestamp\":1760616000,\"weight\":8085,\"samples\":[8030,8084,8085]}\n"
         );
 
         let response = app
@@ -344,6 +408,7 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].timestamp.unix_timestamp(), 1_760_616_000);
         assert_eq!(reports[0].weight, 8_085);
+        assert_eq!(reports[0].samples, [8_030, 8_084, 8_085]);
         assert_eq!(storage.list().unwrap(), reports);
     }
 
@@ -360,7 +425,7 @@ mod tests {
                     Request::post("/api/report")
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from(format!(
-                            r#"{{"timestamp":1760616000,"weight":{weight}}}"#
+                            r#"{{"timestamp":1760616000,"weight":{weight},"samples":[{weight}]}}"#
                         )))
                         .unwrap(),
                 )
@@ -370,9 +435,10 @@ mod tests {
         }
 
         assert_eq!(storage.list().unwrap()[0].weight, 8_086);
+        assert_eq!(storage.list().unwrap()[0].samples, [8_086]);
         assert_eq!(
             fs::read_to_string(data_dir.path().join("reports/1760616000.json")).unwrap(),
-            "{\"timestamp\":1760616000,\"weight\":8086}\n"
+            "{\"timestamp\":1760616000,\"weight\":8086,\"samples\":[8086]}\n"
         );
     }
 
@@ -387,7 +453,7 @@ mod tests {
                 Request::post("/api/report")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"timestamp":999999999999999999,"weight":8085}"#,
+                        r#"{"timestamp":999999999999999999,"weight":8085,"samples":[8085]}"#,
                     ))
                     .unwrap(),
             )
@@ -402,6 +468,50 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_more_than_fifty_samples() {
+        let data_dir = tempdir().unwrap();
+        let app = router(Storage::open(data_dir.path()).unwrap());
+        let samples = vec!["8085"; 51].join(",");
+
+        let response = app
+            .oneshot(
+                Request::post("/api/report")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"timestamp":1760616000,"weight":8085,"samples":[{samples}]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn opening_an_existing_database_adds_the_samples_column() {
+        let data_dir = tempdir().unwrap();
+        let database_path = data_dir.path().join("reports.sqlite");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE reports (
+                     timestamp INTEGER PRIMARY KEY,
+                     weight INTEGER NOT NULL
+                 ) STRICT;
+                 INSERT INTO reports (timestamp, weight) VALUES (1760616000, 8085);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let reports = Storage::open(data_dir.path()).unwrap().list().unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].weight, 8_085);
+        assert!(reports[0].samples.is_empty());
     }
 
     #[tokio::test]

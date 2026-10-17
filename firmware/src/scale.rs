@@ -13,16 +13,14 @@ use esp_idf_svc::bt::ble::gatt::{self, GattInterface, GattStatus, Handle, Proper
 use esp_idf_svc::bt::{BdAddr, Ble, BtDriver, BtStatus, BtUuid};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::modem::BluetoothModem;
-use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::{EspError, ESP_FAIL};
 use log::{debug, error, info, warn};
 
 use crate::base64::Base64;
 use crate::heartbeat::wait_for_valid_time;
-use crate::protocol::{
-    BasicGuestProfileCommand, FinalWeightFrame, HundredthsKg, LiveWeightFrame,
-    SetDisplayUnitCommand,
-};
+use crate::measurement::MeasurementEvent;
+use crate::protocol::{LiveWeightFrame, SetDisplayUnitCommand};
 use crate::status::StatusLight;
 
 const APP_ID: u16 = 0;
@@ -32,10 +30,6 @@ const SCALE_ALT_SERVICE_UUID: BtUuid = BtUuid::uuid16(0xfff0);
 const NOTIFY_CHARACTERISTIC_UUID: BtUuid = BtUuid::uuid16(0x2a10);
 const WRITE_CHARACTERISTIC_UUID: BtUuid = BtUuid::uuid16(0x2a11);
 const CCCD_UUID: BtUuid = BtUuid::uuid16(0x2902);
-const NVS_NAMESPACE: &str = "scale";
-const LAST_WEIGHT_KEY: &str = "last_weight";
-const DEFAULT_LAST_WEIGHT: HundredthsKg = HundredthsKg::new(8_000);
-const MINIMUM_STORED_WEIGHT: HundredthsKg = HundredthsKg::new(5_000);
 
 type ScaleBtDriver = BtDriver<'static, Ble>;
 type ScaleGap = Arc<EspBleGap<'static, Ble, Arc<ScaleBtDriver>>>;
@@ -51,7 +45,6 @@ struct State {
     notify_handle: Option<Handle>,
     cccd_handle: Option<Handle>,
     write_handle: Option<Handle>,
-    profile_sent: bool,
 }
 
 #[derive(Clone)]
@@ -59,35 +52,21 @@ struct ScaleClient {
     gap: ScaleGap,
     gattc: ScaleGattc,
     state: Arc<Mutex<State>>,
-    nvs: Arc<Mutex<EspDefaultNvs>>,
-    reporter: Sender<HundredthsKg>,
+    measurements: Sender<MeasurementEvent>,
 }
 
 pub fn run(
     bluetooth_modem: BluetoothModem<'static>,
     nvs_partition: EspDefaultNvsPartition,
-    reporter: Sender<HundredthsKg>,
+    measurements: Sender<MeasurementEvent>,
     status_light: StatusLight,
 ) -> anyhow::Result<()> {
-    let nvs = EspNvs::new(nvs_partition.clone(), NVS_NAMESPACE, true)?;
-    let last_weight = nvs.get_u32(LAST_WEIGHT_KEY)?.map(HundredthsKg::new);
-    info!(
-        "Previous weight: {}{}",
-        last_weight.unwrap_or(DEFAULT_LAST_WEIGHT),
-        if last_weight.is_some() {
-            " (NVS)"
-        } else {
-            " (default)"
-        }
-    );
-
     let bt = Arc::new(BtDriver::new(bluetooth_modem, Some(nvs_partition))?);
     let client = ScaleClient {
         gap: Arc::new(EspBleGap::new(bt.clone())?),
         gattc: Arc::new(EspGattc::new(bt)?),
         state: Arc::new(Mutex::new(State::default())),
-        nvs: Arc::new(Mutex::new(nvs)),
-        reporter,
+        measurements,
     };
 
     let gap_client = client.clone();
@@ -108,7 +87,7 @@ pub fn run(
     gatt::set_local_mtu(256)?;
     info!("BLE initialized; wake the scale by stepping on it");
     wait_for_valid_time();
-    status_light.ready();
+    status_light.healthy();
 
     loop {
         FreeRtos::delay_ms(10_000);
@@ -229,10 +208,21 @@ impl ScaleClient {
                 is_notify,
                 ..
             } => {
-                if let Ok(frame) = FinalWeightFrame::decode(value) {
-                    self.handle_final_weight(frame.weight)?;
-                } else if let Ok(frame) = LiveWeightFrame::decode(value) {
+                if let Ok(frame) = LiveWeightFrame::decode(value) {
                     debug!("Live weight: {}", frame.weight);
+                    let raw_weight = frame.weight.hundredths();
+                    match u16::try_from(raw_weight) {
+                        Ok(sample) => {
+                            if self
+                                .measurements
+                                .send(MeasurementEvent::Sample(sample))
+                                .is_err()
+                            {
+                                warn!("Could not queue live weight sample");
+                            }
+                        }
+                        Err(_) => warn!("Ignoring live weight outside u16 range: {raw_weight}"),
+                    }
                 }
                 debug!(
                     "rx addr={addr} handle={handle} notify={is_notify} base64={}",
@@ -241,16 +231,17 @@ impl ScaleClient {
             }
             GattcEvent::WriteCharacteristic { status, .. } => {
                 check_gatt_status(status)?;
-                let profile_sent = self.state.lock().unwrap().profile_sent;
-                if profile_sent {
-                    info!("Basic guest profile sent; waiting for scale messages");
-                } else {
-                    info!("Kilograms selected; sending basic guest profile");
-                    self.write_guest_profile(gatt_if)?;
-                }
+                info!("Kilograms selected; waiting for scale messages");
             }
             GattcEvent::Disconnected { addr, reason, .. } => {
                 info!("Scale {addr} disconnected: {reason:?}");
+                if self
+                    .measurements
+                    .send(MeasurementEvent::SessionEnded)
+                    .is_err()
+                {
+                    warn!("Could not end the current measurement session");
+                }
                 *self.state.lock().unwrap() = State {
                     gattc_if: Some(gatt_if),
                     ..State::default()
@@ -405,62 +396,6 @@ impl ScaleClient {
         )
     }
 
-    fn write_guest_profile(&self, gatt_if: GattInterface) -> Result<(), EspError> {
-        let last_weight = self
-            .nvs
-            .lock()
-            .unwrap()
-            .get_u32(LAST_WEIGHT_KEY)?
-            .map(HundredthsKg::new)
-            .unwrap_or(DEFAULT_LAST_WEIGHT);
-        let command = BasicGuestProfileCommand::new(last_weight)
-            .to_bytes()
-            .map_err(|err| {
-                error!("Failed to encode basic guest profile: {err}");
-                EspError::from_infallible::<ESP_FAIL>()
-            })?;
-
-        let mut state = self.state.lock().unwrap();
-        let (Some(conn_id), Some(write_handle)) = (state.conn_id, state.write_handle) else {
-            warn!("Cannot send guest profile: write characteristic is unavailable");
-            return Ok(());
-        };
-        state.profile_sent = true;
-        drop(state);
-
-        info!("Guest profile previous weight: {last_weight}");
-        self.gattc.write_characteristic(
-            gatt_if,
-            conn_id,
-            write_handle,
-            &command,
-            GattWriteType::RequireResponse,
-            GattAuthReq::None,
-        )
-    }
-
-    fn handle_final_weight(&self, weight: HundredthsKg) -> Result<(), EspError> {
-        info!("Authoritative weight: {weight}");
-
-        if self.reporter.send(weight).is_err() {
-            warn!("Could not queue authoritative weight report");
-        }
-
-        if weight.hundredths() <= MINIMUM_STORED_WEIGHT.hundredths() {
-            info!("Not storing authoritative weight at or below {MINIMUM_STORED_WEIGHT}");
-            return Ok(());
-        }
-
-        let nvs = self.nvs.lock().unwrap();
-        if nvs.get_u32(LAST_WEIGHT_KEY)? != Some(weight.hundredths()) {
-            nvs.set_u32(LAST_WEIGHT_KEY, weight.hundredths())?;
-            info!("Stored authoritative weight for the next session");
-        } else {
-            info!("Authoritative weight matches NVS; not overwriting it");
-        }
-
-        Ok(())
-    }
 }
 
 fn check_bt_status(status: BtStatus) -> Result<(), EspError> {
