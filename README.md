@@ -4,17 +4,18 @@ ESP32 firmware for reading a `2A26P-ESCS20MB2` scale over BLE. The goal is to au
 
 ## Setup
 
-Create a `.env` file:
+Create `firmware/.env`:
 
 ```sh
-WIFI_SSID=...
-WIFI_PASSWORD=...
-HEALTHCHECK_URL=...
+cp firmware/.env.example firmware/.env
 ```
+
+Edit the copied file with your WiFi credentials and health-check URL.
 
 Build, flash, and monitor the ESP32:
 
 ```sh
+cd firmware
 cargo run --release
 ```
 

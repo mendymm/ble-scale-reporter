@@ -1,4 +1,5 @@
 {
+  "rust-analyzer.linkedProjects": ["firmware/Cargo.toml"],
   "rust-analyzer.cargo.target": "xtensa-esp32-espidf",
   "rust-analyzer.cargo.targetDir": true,
   "rust-analyzer.cargo.buildScripts.enable": true,

@@ -1,6 +1,8 @@
 /target/
+/firmware/target/
 /.embuild/
-sdkconfig
-sdkconfig.old
-.env
-
+/firmware/.embuild/
+/firmware/sdkconfig
+/firmware/sdkconfig.old
+/.env
+/firmware/.env
