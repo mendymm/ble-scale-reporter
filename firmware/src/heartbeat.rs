@@ -1,3 +1,4 @@
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,12 +12,19 @@ use crate::config::HEALTHCHECK_URL;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const TIME_SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const EARLIEST_VALID_UNIX_TIME: Duration = Duration::from_secs(1_577_836_800); // 2020-01-01
 const THREAD_STACK_SIZE: usize = 16 * 1024;
+static TIME_SYNC_LOCK: Mutex<()> = Mutex::new(());
+static TIME_SYNCED: Condvar = Condvar::new();
 
 pub fn start() -> anyhow::Result<()> {
-    let sntp = EspSntp::new_default().context("could not start SNTP")?;
+    let sntp = EspSntp::new_with_callback(&Default::default(), |_| {
+        let _guard = TIME_SYNC_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        TIME_SYNCED.notify_all();
+    })
+    .context("could not start SNTP")?;
     thread::Builder::new()
         .name("heartbeat".into())
         .stack_size(THREAD_STACK_SIZE)
@@ -39,21 +47,29 @@ fn run(_sntp: EspSntp<'static>) {
 }
 
 pub(crate) fn wait_for_valid_time() {
-    info!("Waiting for SNTP time synchronization before enabling HTTPS");
-
-    loop {
-        let time_is_valid = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .is_ok_and(|elapsed| elapsed >= EARLIEST_VALID_UNIX_TIME);
-
-        if time_is_valid {
-            info!("System time synchronized; HTTPS certificate dates can be validated");
-            return;
-        }
-
-        warn!("System time is not synchronized yet; heartbeat remains paused");
-        thread::sleep(TIME_SYNC_RETRY_INTERVAL);
+    if system_time_is_valid() {
+        return;
     }
+
+    info!("Waiting for SNTP time synchronization before enabling HTTPS");
+    let mut guard = TIME_SYNC_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    while !system_time_is_valid() {
+        guard = TIME_SYNCED
+            .wait(guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+
+    drop(guard);
+    info!("System time synchronized; HTTPS certificate dates can be validated");
+}
+
+fn system_time_is_valid() -> bool {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .is_ok_and(|elapsed| elapsed >= EARLIEST_VALID_UNIX_TIME)
 }
 
 fn send() -> anyhow::Result<()> {
