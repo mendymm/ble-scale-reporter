@@ -9,14 +9,18 @@ The firmware, API, storage, and UI are all self-hosted.
 
 ## How it works
 
-The firmware collects up to 50 live readings over at most eight seconds. It
-finds the largest cluster spanning no more than one kilogram and uses that
-cluster's median as the final weight. The calculated weight and raw readings
-are sent to the server.
+The firmware collects up to 50 live readings over at most eight seconds and
+sends those raw readings to the server.
 
-The server stores every report as both JSON and SQLite data. The UI hides
-sessions with fewer than five samples and suppresses duplicate measurements
-within 30 seconds. Raw reports remain stored for future analysis.
+The JSON report files are the source of truth. At startup, the server rebuilds
+SQLite from them and recalculates every weight. This makes the algorithm
+tunable without losing the original data.
+
+Readings below 35 kg are ignored. The server finds the largest cluster spanning
+no more than one kilogram and uses its median. It rejects a result that differs
+by at least 10 kg from an accepted measurement in the previous 60 days. The UI
+also hides sessions with fewer than five samples and duplicate measurements
+within 30 seconds.
 
 ## Certificates
 
@@ -70,11 +74,11 @@ $DATA_DIR/
 
 ## API
 
-`POST /api/report` accepts a Unix timestamp, a weight in hundredths of a
-kilogram, and the raw readings:
+`POST /api/report` accepts a Unix timestamp and raw readings in hundredths of a
+kilogram:
 
 ```json
-{"timestamp":1760616000,"weight":8085,"samples":[8030,8072,8084,8085,8085]}
+{"timestamp":1760616000,"samples":[8030,8072,8084,8085,8085]}
 ```
 
 `GET /api/reports` supplies measurements to the UI. `GET /` serves the UI.

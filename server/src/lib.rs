@@ -35,6 +35,10 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REPORT_SAMPLES: usize = 50;
 const MIN_DISPLAY_SAMPLES: usize = 5;
 const DISPLAY_DEDUP_SECONDS: i64 = 30;
+const MIN_VALID_WEIGHT: u16 = 3_500;
+const MAX_STABLE_SPAN: u16 = 100;
+const MAX_RECENT_WEIGHT_CHANGE: u16 = 1_000;
+const RECENT_MEASUREMENT_SECONDS: i64 = 60 * 24 * 60 * 60;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
@@ -44,12 +48,34 @@ pub struct Storage {
     write_lock: Arc<Mutex<()>>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SampleReport {
+    #[serde(with = "time::serde::timestamp")]
+    timestamp: OffsetDateTime,
+    samples: Vec<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchivedReport {
+    #[serde(with = "time::serde::timestamp")]
+    timestamp: OffsetDateTime,
+    #[serde(default)]
+    samples: Vec<u16>,
+    #[serde(default)]
+    weight: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Report {
     #[serde(with = "time::serde::timestamp")]
     pub timestamp: OffsetDateTime,
     pub weight: u32,
-    pub samples: Vec<u16>,
+}
+
+struct CalculatedReport {
+    timestamp: OffsetDateTime,
+    weight: Option<u32>,
+    samples: Vec<u16>,
 }
 
 impl Storage {
@@ -62,50 +88,29 @@ impl Storage {
         };
 
         fs::create_dir_all(&storage.reports_dir)?;
-        let connection = storage.connect()?;
-        connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
-             CREATE TABLE IF NOT EXISTS reports (
-                 timestamp INTEGER PRIMARY KEY,
-                 weight INTEGER NOT NULL CHECK (weight BETWEEN 0 AND 4294967295),
-                 samples TEXT NOT NULL DEFAULT '[]'
-             ) STRICT;",
-        )?;
-        ensure_samples_column(&connection)?;
+        storage.rebuild_database()?;
 
         Ok(storage)
     }
 
-    pub fn save(&self, report: &Report) -> Result<(), StorageError> {
+    fn save(&self, report: &SampleReport) -> Result<(), StorageError> {
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| StorageError::WriteLockPoisoned)?;
         self.write_report_file(report)?;
-
-        let connection = self.connect()?;
-        let samples = serde_json::to_string(&report.samples)?;
-        connection.execute(
-            "INSERT INTO reports (timestamp, weight, samples)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(timestamp) DO UPDATE SET
-                 weight = excluded.weight,
-                 samples = excluded.samples",
-            params![
-                report.timestamp.unix_timestamp(),
-                i64::from(report.weight),
-                samples
-            ],
-        )?;
-
-        Ok(())
+        self.rebuild_database()
     }
 
     pub fn list(&self) -> Result<Vec<Report>, StorageError> {
         let connection = self.connect()?;
         let mut statement = connection
-            .prepare("SELECT timestamp, weight, samples FROM reports ORDER BY timestamp")?;
+            .prepare(
+                "SELECT timestamp, weight, samples
+                 FROM reports
+                 WHERE weight IS NOT NULL
+                 ORDER BY timestamp",
+            )?;
         let stored_reports = statement
             .query_map([], |row| {
                 Ok((
@@ -116,21 +121,19 @@ impl Storage {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        stored_reports
+        let reports = stored_reports
             .into_iter()
             .map(|(timestamp, weight, samples)| {
                 let timestamp = OffsetDateTime::from_unix_timestamp(timestamp)
                     .map_err(|_| StorageError::InvalidTimestamp(timestamp))?;
                 let weight =
                     u32::try_from(weight).map_err(|_| StorageError::InvalidWeight(weight))?;
-                let samples = serde_json::from_str(&samples)?;
-                Ok(Report {
-                    timestamp,
-                    weight,
-                    samples,
-                })
+                let samples: Vec<u16> = serde_json::from_str(&samples)?;
+                Ok((Report { timestamp, weight }, samples.len()))
             })
-            .collect()
+            .collect::<Result<Vec<_>, StorageError>>()?;
+
+        Ok(reports_for_display(reports))
     }
 
     fn connect(&self) -> Result<Connection, StorageError> {
@@ -139,7 +142,57 @@ impl Storage {
         Ok(connection)
     }
 
-    fn write_report_file(&self, report: &Report) -> Result<(), StorageError> {
+    fn rebuild_database(&self) -> Result<(), StorageError> {
+        let reports = calculate_reports(self.read_report_files()?);
+
+        let mut connection = self.connect()?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;",
+        )?;
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "DROP TABLE IF EXISTS reports;
+             CREATE TABLE reports (
+                 timestamp INTEGER PRIMARY KEY,
+                 weight INTEGER CHECK (weight IS NULL OR weight BETWEEN 0 AND 4294967295),
+                 samples TEXT NOT NULL
+             ) STRICT;",
+        )?;
+
+        for report in reports {
+            let samples = serde_json::to_string(&report.samples)?;
+            transaction.execute(
+                "INSERT INTO reports (timestamp, weight, samples) VALUES (?1, ?2, ?3)",
+                params![
+                    report.timestamp.unix_timestamp(),
+                    report.weight.map(i64::from),
+                    samples
+                ],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn read_report_files(&self) -> Result<Vec<ArchivedReport>, StorageError> {
+        let mut reports = Vec::new();
+
+        for entry in fs::read_dir(&self.reports_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+
+            let contents = fs::read(path)?;
+            reports.push(serde_json::from_slice(&contents)?);
+        }
+
+        Ok(reports)
+    }
+
+    fn write_report_file(&self, report: &SampleReport) -> Result<(), StorageError> {
         let timestamp = report.timestamp.unix_timestamp();
         let destination = self.reports_dir.join(format!("{timestamp}.json"));
         let temp_id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
@@ -165,23 +218,90 @@ impl Storage {
     }
 }
 
-fn ensure_samples_column(connection: &Connection) -> Result<(), rusqlite::Error> {
-    let has_samples = {
-        let mut statement = connection.prepare("PRAGMA table_info(reports)")?;
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?;
-        columns.iter().any(|column| column == "samples")
-    };
+fn calculate_reports(mut reports: Vec<ArchivedReport>) -> Vec<CalculatedReport> {
+    reports.sort_by_key(|report| report.timestamp);
+    let mut last_accepted: Option<(i64, u16)> = None;
 
-    if !has_samples {
-        connection.execute(
-            "ALTER TABLE reports ADD COLUMN samples TEXT NOT NULL DEFAULT '[]'",
-            [],
-        )?;
+    reports
+        .into_iter()
+        .map(|report| {
+            let can_establish_baseline =
+                report.samples.is_empty() || report.samples.len() >= MIN_DISPLAY_SAMPLES;
+            let candidate = if report.samples.is_empty() {
+                report
+                    .weight
+                    .and_then(|weight| u16::try_from(weight).ok())
+                    .filter(|weight| *weight >= MIN_VALID_WEIGHT)
+            } else {
+                calculate_weight(&report.samples)
+            };
+
+            let weight = candidate.filter(|candidate| {
+                let Some((last_timestamp, last_weight)) = last_accepted else {
+                    return true;
+                };
+                let age = report.timestamp.unix_timestamp() - last_timestamp;
+                age > RECENT_MEASUREMENT_SECONDS
+                    || candidate.abs_diff(last_weight) < MAX_RECENT_WEIGHT_CHANGE
+            });
+
+            if let Some(weight) = weight.filter(|_| can_establish_baseline) {
+                last_accepted = Some((report.timestamp.unix_timestamp(), weight));
+            }
+
+            CalculatedReport {
+                timestamp: report.timestamp,
+                weight: weight.map(u32::from),
+                samples: report.samples,
+            }
+        })
+        .collect()
+}
+
+fn calculate_weight(samples: &[u16]) -> Option<u16> {
+    let mut sorted = samples
+        .iter()
+        .copied()
+        .filter(|weight| *weight >= MIN_VALID_WEIGHT)
+        .collect::<Vec<_>>();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_unstable();
+
+    let mut window_start = 0;
+    let mut best_start = 0;
+    let mut best_end = 1;
+
+    for window_end in 0..sorted.len() {
+        while sorted[window_end] - sorted[window_start] > MAX_STABLE_SPAN {
+            window_start += 1;
+        }
+
+        let window_len = window_end + 1 - window_start;
+        let best_len = best_end - best_start;
+        let window_span = sorted[window_end] - sorted[window_start];
+        let best_span = sorted[best_end - 1] - sorted[best_start];
+        let equally_dense_but_better = window_len == best_len
+            && (window_span < best_span
+                || (window_span == best_span
+                    && sorted[window_end] > sorted[best_end - 1]));
+
+        if window_len > best_len || equally_dense_but_better {
+            best_start = window_start;
+            best_end = window_end + 1;
+        }
     }
 
-    Ok(())
+    let stable = &sorted[best_start..best_end];
+    let middle = stable.len() / 2;
+
+    if stable.len() % 2 == 0 {
+        let sum = u32::from(stable[middle - 1]) + u32::from(stable[middle]);
+        Some(sum.div_ceil(2) as u16)
+    } else {
+        Some(stable[middle])
+    }
 }
 
 fn create_new_file(path: &Path) -> Result<File, std::io::Error> {
@@ -203,7 +323,7 @@ pub fn router(storage: Storage) -> Router {
 
 async fn create_report(
     State(storage): State<Storage>,
-    Json(report): Json<Report>,
+    Json(report): Json<SampleReport>,
 ) -> Result<StatusCode, AppError> {
     if report.samples.is_empty() {
         return Err(AppError::invalid_report("samples must not be empty"));
@@ -226,30 +346,30 @@ async fn list_reports(State(storage): State<Storage>) -> Result<Json<Vec<Report>
         .map_err(|join_error| AppError::new("database task failed", join_error))?
         .map_err(|storage_error| AppError::new("could not load reports", storage_error))?;
 
-    Ok(Json(reports_for_display(reports)))
+    Ok(Json(reports))
 }
 
-fn reports_for_display(reports: Vec<Report>) -> Vec<Report> {
+fn reports_for_display(reports: Vec<(Report, usize)>) -> Vec<Report> {
     let mut last_displayed_at = None;
 
     reports
         .into_iter()
-        .filter(|report| {
+        .filter_map(|(report, sample_count)| {
             // Empty sample lists belong to reports created before samples were
             // recorded. Keep those historical measurements visible.
-            if !report.samples.is_empty() && report.samples.len() < MIN_DISPLAY_SAMPLES {
-                return false;
+            if sample_count != 0 && sample_count < MIN_DISPLAY_SAMPLES {
+                return None;
             }
 
             let timestamp = report.timestamp.unix_timestamp();
             if last_displayed_at
                 .is_some_and(|previous| timestamp - previous < DISPLAY_DEDUP_SECONDS)
             {
-                return false;
+                return None;
             }
 
             last_displayed_at = Some(timestamp);
-            true
+            Some(report)
         })
         .collect()
 }
@@ -398,7 +518,10 @@ mod tests {
     use time::OffsetDateTime;
     use tower::ServiceExt;
 
-    use super::{Report, Storage, reports_for_display, router};
+    use super::{
+        ArchivedReport, Report, Storage, calculate_reports, calculate_weight,
+        reports_for_display, router,
+    };
 
     #[tokio::test]
     async fn posting_a_report_persists_and_lists_it() {
@@ -412,7 +535,7 @@ mod tests {
                 Request::post("/api/report")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"timestamp":1760616000,"weight":8085,"samples":[8030,8072,8084,8085,8085]}"#,
+                        r#"{"timestamp":1760616000,"samples":[8084,8085,8085,8086,8085]}"#,
                     ))
                     .unwrap(),
             )
@@ -422,7 +545,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(
             fs::read_to_string(data_dir.path().join("reports/1760616000.json")).unwrap(),
-            "{\"timestamp\":1760616000,\"weight\":8085,\"samples\":[8030,8072,8084,8085,8085]}\n"
+            "{\"timestamp\":1760616000,\"samples\":[8084,8085,8085,8086,8085]}\n"
         );
 
         let response = app
@@ -436,7 +559,6 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].timestamp.unix_timestamp(), 1_760_616_000);
         assert_eq!(reports[0].weight, 8_085);
-        assert_eq!(reports[0].samples, [8_030, 8_072, 8_084, 8_085, 8_085]);
         assert_eq!(storage.list().unwrap(), reports);
     }
 
@@ -453,7 +575,7 @@ mod tests {
                     Request::post("/api/report")
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from(format!(
-                            r#"{{"timestamp":1760616000,"weight":{weight},"samples":[{weight}]}}"#
+                            r#"{{"timestamp":1760616000,"samples":[{weight},{weight},{weight},{weight},{weight}]}}"#
                         )))
                         .unwrap(),
                 )
@@ -463,10 +585,9 @@ mod tests {
         }
 
         assert_eq!(storage.list().unwrap()[0].weight, 8_086);
-        assert_eq!(storage.list().unwrap()[0].samples, [8_086]);
         assert_eq!(
             fs::read_to_string(data_dir.path().join("reports/1760616000.json")).unwrap(),
-            "{\"timestamp\":1760616000,\"weight\":8086,\"samples\":[8086]}\n"
+            "{\"timestamp\":1760616000,\"samples\":[8086,8086,8086,8086,8086]}\n"
         );
     }
 
@@ -481,7 +602,7 @@ mod tests {
                 Request::post("/api/report")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"timestamp":999999999999999999,"weight":8085,"samples":[8085]}"#,
+                        r#"{"timestamp":999999999999999999,"samples":[8085]}"#,
                     ))
                     .unwrap(),
             )
@@ -509,7 +630,7 @@ mod tests {
                 Request::post("/api/report")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(format!(
-                        r#"{{"timestamp":1760616000,"weight":8085,"samples":[{samples}]}}"#
+                        r#"{{"timestamp":1760616000,"samples":[{samples}]}}"#
                     )))
                     .unwrap(),
             )
@@ -520,41 +641,40 @@ mod tests {
     }
 
     #[test]
-    fn opening_an_existing_database_adds_the_samples_column() {
+    fn startup_rebuilds_the_database_from_report_files() {
         let data_dir = tempdir().unwrap();
+        let reports_dir = data_dir.path().join("reports");
+        fs::create_dir(&reports_dir).unwrap();
+        fs::write(
+            reports_dir.join("1760616000.json"),
+            r#"{"timestamp":1760616000,"weight":30,"samples":[7960,7960,7960,7960,330,195,0,75,195,295,220,295,30,25,20,30,45,50,50,0]}"#,
+        )
+        .unwrap();
         let database_path = data_dir.path().join("reports.sqlite");
         let connection = Connection::open(&database_path).unwrap();
         connection
-            .execute_batch(
-                "CREATE TABLE reports (
-                     timestamp INTEGER PRIMARY KEY,
-                     weight INTEGER NOT NULL
-                 ) STRICT;
-                 INSERT INTO reports (timestamp, weight) VALUES (1760616000, 8085);",
-            )
+            .execute_batch("CREATE TABLE stale (value INTEGER) STRICT;")
             .unwrap();
         drop(connection);
 
         let reports = Storage::open(data_dir.path()).unwrap().list().unwrap();
 
         assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].weight, 8_085);
-        assert!(reports[0].samples.is_empty());
+        assert_eq!(reports[0].weight, 7_960);
     }
 
     #[test]
     fn display_reports_filters_short_and_duplicate_sessions() {
-        let report = |timestamp, samples| Report {
+        let report = |timestamp| Report {
             timestamp: OffsetDateTime::from_unix_timestamp(timestamp).unwrap(),
             weight: 8_085,
-            samples,
         };
         let reports = vec![
-            report(100, vec![8_085; 5]),
-            report(110, vec![8_085]),
-            report(120, vec![8_085; 5]),
-            report(130, vec![8_085; 5]),
-            report(200, Vec::new()),
+            (report(100), 5),
+            (report(110), 1),
+            (report(120), 5),
+            (report(130), 5),
+            (report(200), 0),
         ];
 
         let displayed = reports_for_display(reports);
@@ -564,6 +684,36 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(timestamps, [100, 130, 200]);
+    }
+
+    #[test]
+    fn weight_uses_the_valid_stable_cluster() {
+        let samples = [
+            7_960, 7_960, 7_960, 7_960, 330, 195, 0, 75, 195, 295, 220, 295, 30, 25, 20,
+            30, 45, 50, 50, 0,
+        ];
+
+        assert_eq!(calculate_weight(&samples), Some(7_960));
+        assert_eq!(calculate_weight(&[3_499, 100, 0]), None);
+    }
+
+    #[test]
+    fn recent_ten_kilogram_outlier_is_ignored() {
+        let report = |timestamp, weight| ArchivedReport {
+            timestamp: OffsetDateTime::from_unix_timestamp(timestamp).unwrap(),
+            samples: vec![weight; 5],
+            weight: None,
+        };
+        let day = 24 * 60 * 60;
+        let calculated = calculate_reports(vec![
+            report(0, 8_000),
+            report(day, 9_000),
+            report(61 * day, 9_000),
+        ]);
+
+        assert_eq!(calculated[0].weight, Some(8_000));
+        assert_eq!(calculated[1].weight, None);
+        assert_eq!(calculated[2].weight, Some(9_000));
     }
 
     #[tokio::test]

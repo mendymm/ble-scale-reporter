@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import math
 import random
 import sqlite3
@@ -34,7 +35,7 @@ def main() -> None:
     final_day = datetime.now(UTC).replace(hour=7, minute=30, second=0, microsecond=0)
     first_day = final_day - timedelta(days=args.days - 1)
 
-    reports: list[tuple[int, int]] = []
+    reports: list[tuple[int, int, list[int]]] = []
     for day in range(args.days):
         # Skip an occasional day so the time axis is not perfectly uniform.
         if day not in (0, args.days - 1) and random_source.random() < 0.08:
@@ -46,38 +47,44 @@ def main() -> None:
         noise = random_source.gauss(0, 0.16)
         weight_hundredths = round((trend + weekly_variation + noise) * 100)
         timestamp = int((first_day + timedelta(days=day)).timestamp())
-        reports.append((timestamp, weight_hundredths))
+        samples = [
+            weight_hundredths + offset
+            for offset in (-6, -4, -2, -1, 0, 0, 0, 1, 2, 4, 6)
+        ]
+        reports.append((timestamp, weight_hundredths, samples))
+
+    reports_dir = args.data_dir / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    for timestamp, _, samples in reports:
+        report = {"timestamp": timestamp, "samples": samples}
+        reports_dir.joinpath(f"{timestamp}.json").write_text(
+            json.dumps(report, separators=(",", ":")) + "\n"
+        )
 
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute(
+        connection.executescript(
             """
-            CREATE TABLE IF NOT EXISTS reports (
+            DROP TABLE IF EXISTS reports;
+            CREATE TABLE reports (
                 timestamp INTEGER PRIMARY KEY,
-                weight INTEGER NOT NULL CHECK (weight BETWEEN 0 AND 4294967295),
-                samples TEXT NOT NULL DEFAULT '[]'
-            ) STRICT
+                weight INTEGER CHECK (weight IS NULL OR weight BETWEEN 0 AND 4294967295),
+                samples TEXT NOT NULL
+            ) STRICT;
             """
         )
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(reports)")
-        }
-        if "samples" not in columns:
-            connection.execute(
-                "ALTER TABLE reports ADD COLUMN samples TEXT NOT NULL DEFAULT '[]'"
-            )
         connection.executemany(
             """
             INSERT INTO reports (timestamp, weight, samples)
-            VALUES (?, ?, '[]')
-            ON CONFLICT(timestamp) DO UPDATE SET
-                weight = excluded.weight,
-                samples = excluded.samples
+            VALUES (?, ?, ?)
             """,
-            reports,
+            [
+                (timestamp, weight, json.dumps(samples, separators=(",", ":")))
+                for timestamp, weight, samples in reports
+            ],
         )
 
-    print(f"Wrote {len(reports)} reports to {database_path}")
+    print(f"Wrote {len(reports)} reports to {reports_dir} and {database_path}")
 
 
 if __name__ == "__main__":
