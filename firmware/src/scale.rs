@@ -22,6 +22,7 @@ use crate::protocol::{
     BasicGuestProfileCommand, FinalWeightFrame, HundredthsKg, LiveWeightFrame,
     SetDisplayUnitCommand,
 };
+use crate::status::StatusLight;
 
 const APP_ID: u16 = 0;
 const SCALE_COMPANY_ID_LE: [u8; 2] = [0x10, 0x1a];
@@ -65,6 +66,7 @@ pub fn run(
     bluetooth_modem: BluetoothModem<'static>,
     nvs_partition: EspDefaultNvsPartition,
     reporter: Sender<HundredthsKg>,
+    status_light: StatusLight,
 ) -> anyhow::Result<()> {
     let nvs = EspNvs::new(nvs_partition.clone(), NVS_NAMESPACE, true)?;
     let last_weight = nvs.get_u32(LAST_WEIGHT_KEY)?.map(HundredthsKg::new);
@@ -104,6 +106,7 @@ pub fn run(
     client.gattc.register_app(APP_ID)?;
     gatt::set_local_mtu(256)?;
     info!("BLE initialized; wake the scale by stepping on it");
+    status_light.ready();
 
     loop {
         FreeRtos::delay_ms(10_000);
