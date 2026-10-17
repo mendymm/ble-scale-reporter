@@ -38,7 +38,7 @@ fn run(_sntp: EspSntp<'static>) {
     }
 }
 
-fn wait_for_valid_time() {
+pub(crate) fn wait_for_valid_time() {
     info!("Waiting for SNTP time synchronization before enabling HTTPS");
 
     loop {

@@ -1,7 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
 
-const REQUIRED_CONFIG: [&str; 3] = ["WIFI_SSID", "WIFI_PASSWORD", "HEALTHCHECK_URL"];
+const REQUIRED_CONFIG: [&str; 4] = [
+    "WIFI_SSID",
+    "WIFI_PASSWORD",
+    "HEALTHCHECK_URL",
+    "REPORT_URL",
+];
 
 fn main() {
     println!("cargo:rerun-if-changed=.env");

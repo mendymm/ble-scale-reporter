@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc::Sender, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -58,11 +58,13 @@ struct ScaleClient {
     gattc: ScaleGattc,
     state: Arc<Mutex<State>>,
     nvs: Arc<Mutex<EspDefaultNvs>>,
+    reporter: Sender<HundredthsKg>,
 }
 
 pub fn run(
     bluetooth_modem: BluetoothModem<'static>,
     nvs_partition: EspDefaultNvsPartition,
+    reporter: Sender<HundredthsKg>,
 ) -> anyhow::Result<()> {
     let nvs = EspNvs::new(nvs_partition.clone(), NVS_NAMESPACE, true)?;
     let last_weight = nvs.get_u32(LAST_WEIGHT_KEY)?.map(HundredthsKg::new);
@@ -82,6 +84,7 @@ pub fn run(
         gattc: Arc::new(EspGattc::new(bt)?),
         state: Arc::new(Mutex::new(State::default())),
         nvs: Arc::new(Mutex::new(nvs)),
+        reporter,
     };
 
     let gap_client = client.clone();
@@ -433,6 +436,10 @@ impl ScaleClient {
 
     fn handle_final_weight(&self, weight: HundredthsKg) -> Result<(), EspError> {
         info!("Authoritative weight: {weight}");
+
+        if self.reporter.send(weight).is_err() {
+            warn!("Could not queue authoritative weight report");
+        }
 
         if weight.hundredths() <= MINIMUM_STORED_WEIGHT.hundredths() {
             info!("Not storing authoritative weight at or below {MINIMUM_STORED_WEIGHT}");

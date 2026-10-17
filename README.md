@@ -10,7 +10,7 @@ Create `firmware/.env`:
 cp firmware/.env.example firmware/.env
 ```
 
-Edit the copied file with your WiFi credentials and health-check URL.
+Edit the copied file with your WiFi credentials, health-check URL, and report URL. The report URL may use either `http://` or `https://`.
 
 Build, flash, and monitor the ESP32:
 
