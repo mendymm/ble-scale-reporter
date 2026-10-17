@@ -9,7 +9,7 @@ use esp_idf_svc::tls::X509;
 use log::{info, warn};
 
 use crate::config::REPORT_URL;
-use crate::heartbeat::wait_for_valid_time;
+use crate::heartbeat::{send_report_failure, wait_for_valid_time};
 use crate::protocol::HundredthsKg;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -32,7 +32,13 @@ fn run(receiver: Receiver<HundredthsKg>) {
 
         match send(weight) {
             Ok(()) => info!("Authoritative weight report accepted: {weight}"),
-            Err(error) => warn!("Authoritative weight report failed: {error:#}"),
+            Err(error) => {
+                warn!("Authoritative weight report failed: {error:#}");
+                let message = format!("Weight report failed: {error}");
+                if let Err(notification_error) = send_report_failure(&message) {
+                    warn!("Could not send report failure notification: {notification_error:#}");
+                }
+            }
         }
     }
 }

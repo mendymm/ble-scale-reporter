@@ -79,3 +79,36 @@ fn send() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+pub(crate) fn send_report_failure(message: &str) -> anyhow::Result<()> {
+    let failure_url = format!("{}/fail", HEALTHCHECK_URL.trim_end_matches('/'));
+    let content_length = message.len().to_string();
+    let configuration = Configuration {
+        timeout: Some(REQUEST_TIMEOUT),
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        ..Default::default()
+    };
+    let connection = EspHttpConnection::new(&configuration)
+        .context("could not create failure notification HTTPS connection")?;
+    let mut client = Client::wrap(connection);
+    let headers = [
+        ("content-type", "text/plain; charset=utf-8"),
+        ("content-length", content_length.as_str()),
+    ];
+    let mut request = client
+        .post(&failure_url, &headers)
+        .context("could not start failure notification POST")?;
+    request
+        .write(message.as_bytes())
+        .context("could not write failure notification body")?;
+    let response = request
+        .submit()
+        .context("could not submit failure notification POST")?;
+    let status = response.status();
+
+    if !(200..300).contains(&status) {
+        bail!("failure notification server returned HTTP {status}");
+    }
+
+    Ok(())
+}
