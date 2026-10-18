@@ -104,12 +104,41 @@
       reports.map((report) => kilograms(report.weight)),
     ];
     latestTimestamp = reports.at(-1).timestamp;
+    const tooltip = document.createElement("div");
+    tooltip.className = "chart-tooltip";
+    tooltip.hidden = true;
+    tooltip.setAttribute("role", "status");
+
+    function updateTooltip(u) {
+      const { idx, left, top } = u.cursor;
+      const weight = idx == null ? null : u.data[1][idx];
+
+      if (weight == null || left == null || top == null || left < 0 || top < 0) {
+        tooltip.hidden = true;
+        return;
+      }
+
+      tooltip.textContent = `${weight.toFixed(2)} kg (${pounds(weight).toFixed(1)} lbs)`;
+      tooltip.hidden = false;
+
+      const cursorX = u.root.offsetLeft + u.bbox.left + left;
+      const cursorY = u.root.offsetTop + u.bbox.top + top;
+      const margin = 8;
+      const x = Math.min(cursorX + 14, chartElement.clientWidth - tooltip.offsetWidth - margin);
+      const y = Math.min(cursorY + 14, chartElement.clientHeight - tooltip.offsetHeight - margin);
+      tooltip.style.left = `${Math.max(margin, x)}px`;
+      tooltip.style.top = `${Math.max(margin, y)}px`;
+    }
+
     const options = {
       width: Math.max(chartElement.clientWidth, 280),
       height: window.innerWidth <= 720 ? 300 : 340,
       legend: { show: false },
       cursor: {
         drag: { x: true, y: false },
+      },
+      hooks: {
+        setCursor: [updateTooltip],
       },
       scales: {
         x: { time: true },
@@ -163,6 +192,7 @@
     };
 
     chart = new uPlot(options, data, chartElement);
+    chartElement.append(tooltip);
     resizeObserver = new ResizeObserver(([entry]) => {
       const width = Math.floor(entry.contentRect.width);
       const height = window.innerWidth <= 720 ? 300 : 340;

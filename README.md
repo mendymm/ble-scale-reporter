@@ -52,12 +52,23 @@ The health-check URL is configurable; it does not need to use a hosted service.
 
 ## Server
 
-The Linux server listens on HTTPS port 443. Pass its private key, certificate
-chain, and data directory:
+The server listens on HTTP port 3000 by default. Pass the data directory with
+`--data-dir`:
 
 ```sh
 cd server
-./target/release/ble-scale-server key.pem cert.pem /var/lib/ble-scale
+./target/release/ble-scale-server --data-dir /var/lib/ble-scale
+```
+
+To use HTTPS, set port 443 and pass the certificate chain and matching private
+key:
+
+```sh
+./target/release/ble-scale-server \
+  --data-dir /var/lib/ble-scale \
+  --port 443 \
+  --cert cert.pem \
+  --key key.pem
 ```
 
 Run `ble-scale-server --help` for usage. Binding port 443 requires root or
